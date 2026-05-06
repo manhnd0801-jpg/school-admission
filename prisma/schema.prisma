@@ -1,0 +1,212 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// Enums
+// ============================================================
+
+enum UserRole {
+  ADMIN // Quan_Tri_Vien
+  STAFF // Nhan_Vien_Tuyen_Sinh
+}
+
+enum SectionType {
+  HERO
+  INTRO
+  PROGRAM
+  ACHIEVEMENT
+  FACILITY
+  EXTRACURRICULAR
+  TEACHER
+  ADMISSION
+  TUITION
+  TESTIMONIAL
+  FOOTER
+}
+
+enum ArticleStatus {
+  DRAFT
+  PENDING
+  PUBLISHED
+  ARCHIVED
+}
+
+enum LeadStatus {
+  NEW // Mới
+  CONTACTED // Đã liên hệ
+  CONSULTING // Đang tư vấn
+  REGISTERED // Đã đăng ký
+  DROPPED // Không tiếp tục
+}
+
+// ============================================================
+// Models
+// ============================================================
+
+// Người dùng CMS
+model User {
+  id                  String    @id @default(cuid())
+  email               String    @unique
+  passwordHash        String // bcrypt, cost factor >= 12
+  name                String
+  role                UserRole  @default(STAFF)
+  isActive            Boolean   @default(true)
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  // Relations
+  assignedLeads     Lead[]             @relation("AssignedTo")
+  leadNotes         LeadNote[]
+  contentEdits      ContentHistory[]
+  auditLogs         AuditLog[]
+  exportLogs        ExportLog[]
+  articles          Article[]
+  leadStatusChanges LeadStatusHistory[]
+}
+
+// Section nội dung Landing Page
+// Section.content được validate bằng Zod schema (src/schemas/section-content.ts) trước khi lưu
+model Section {
+  id        String      @id @default(cuid())
+  type      SectionType @unique
+  title     String // tên hiển thị trong CMS
+  content   Json // nội dung linh hoạt theo từng section type
+  isVisible Boolean     @default(true)
+  order     Int // thứ tự hiển thị
+  updatedAt DateTime    @updatedAt
+
+  history ContentHistory[]
+}
+
+// Lịch sử chỉnh sửa nội dung — cleanup job xóa records > 30 ngày
+model ContentHistory {
+  id            String   @id @default(cuid())
+  sectionId     String
+  section       Section  @relation(fields: [sectionId], references: [id])
+  editorId      String
+  editor        User     @relation(fields: [editorId], references: [id])
+  contentBefore Json
+  contentAfter  Json
+  createdAt     DateTime @default(now())
+
+  @@index([sectionId, createdAt])
+  @@index([createdAt]) // cho cleanup job WHERE createdAt < now() - 30 days
+}
+
+// Bài viết
+model Article {
+  id          String        @id @default(cuid())
+  title       String
+  slug        String        @unique
+  content     String // HTML từ TipTap
+  excerpt     String?
+  coverImage  String? // URL ảnh đại diện
+  category    String
+  status      ArticleStatus @default(DRAFT)
+  publishedAt DateTime?
+  scheduledAt DateTime? // lên lịch xuất bản — BullMQ scheduled-publish worker poll field này
+  authorId    String
+  author      User          @relation(fields: [authorId], references: [id])
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([status, publishedAt])
+  @@index([slug])
+  @@index([scheduledAt]) // cho worker poll scheduled articles
+}
+
+// Lead đăng ký tư vấn
+// Unique constraint (phone, createdAt window) được enforce ở application layer với DB unique index
+model Lead {
+  id             String     @id @default(cuid())
+  parentName     String
+  phone          String
+  email          String?
+  studentName    String
+  expectedYear   Int
+  note           String?
+  status         LeadStatus @default(NEW)
+  assignedToId   String?
+  assignedTo     User?      @relation("AssignedTo", fields: [assignedToId], references: [id])
+  privacyConsent Boolean    @default(true)
+  sourceIp       String? // cho rate limiting và audit
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  statusHistory LeadStatusHistory[]
+  notes         LeadNote[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([phone])
+  @@index([phone, createdAt]) // cho duplicate check query
+}
+
+// Lịch sử thay đổi trạng thái Lead
+model LeadStatusHistory {
+  id          String     @id @default(cuid())
+  leadId      String
+  lead        Lead       @relation(fields: [leadId], references: [id])
+  fromStatus  LeadStatus?
+  toStatus    LeadStatus
+  changedById String
+  changedBy   User       @relation(fields: [changedById], references: [id])
+  changedAt   DateTime   @default(now())
+
+  @@index([leadId, changedAt])
+}
+
+// Ghi chú Lead
+model LeadNote {
+  id        String   @id @default(cuid())
+  leadId    String
+  lead      Lead     @relation(fields: [leadId], references: [id])
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id])
+  content   String
+  createdAt DateTime @default(now())
+
+  @@index([leadId])
+}
+
+// Audit log
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id])
+  action     String // LOGIN, LOGOUT, CONTENT_UPDATE, LEAD_EXPORT, ...
+  resource   String?
+  resourceId String?
+  metadata   Json?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+}
+
+// Log xuất dữ liệu
+model ExportLog {
+  id           String   @id @default(cuid())
+  exportedById String
+  exportedBy   User     @relation(fields: [exportedById], references: [id])
+  recordCount  Int
+  filters      Json?
+  createdAt    DateTime @default(now())
+}
+
+// NOTE: RateLimit KHÔNG dùng PostgreSQL model.
+// Rate limiting được implement bằng Redis (xem src/lib/rate-limit.ts):
+//   INCR key → EXPIRE key windowSeconds → check count > limit
+// Lý do: Redis INCR/EXPIRE là atomic, O(1), tự expire — phù hợp hơn DB quan hệ cho hot path.
